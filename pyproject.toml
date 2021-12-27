@@ -53,7 +53,7 @@ prometheus_client = "^0.12"
 #transliterate = "1.10.2"
 
 ### For publishing to PyPI:
-yt-dlp = "2021.12.25"
+yt-dlp = "2021.12.27"
 #youtube_dl = "2021.12.17"
 #youtube-dlc = "2020.11.11.post3"
 #scdl = "1.6.12"
