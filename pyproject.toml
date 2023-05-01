@@ -104,7 +104,7 @@ flakeheaven = "^3.2"
 optional = true
 
 [tool.poetry.group.docs.dependencies]
-sphinx = "^6.1"
+sphinx = ">=6.1,<8.0"
 sphinx-autodoc-typehints = "^1.22"
 m2r2 = "^0.3"
 tomli = "^2.0"
