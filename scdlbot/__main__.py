@@ -8,6 +8,7 @@ import os
 import pathlib
 import platform
 import random
+import resource
 import shutil
 import tempfile
 import threading
@@ -26,10 +27,12 @@ import requests
 import sdnotify
 from mutagen.id3 import ID3, ID3v1SaveOptions
 from mutagen.mp3 import EasyMP3 as MP3
+from pebble import ProcessPool
 from telegram import Bot, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, TelegramError, TimedOut
-from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, PicklePersistence, filters
+
+# from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, TelegramError, TimedOut
+from telegram.ext import AIORateLimiter, Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, PicklePersistence, filters
 from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
@@ -50,6 +53,16 @@ except ImportError:
 
 from boltons.urlutils import URL
 from plumbum import ProcessExecutionError, local
+
+# FIXME Use maximum 1500 mebibytes per task:
+MAX_MEM = 1500 * 1024 * 1024
+
+
+def pp_initializer(limit):
+    """Set maximum amount of memory each worker process can allocate."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_BOT_API = os.getenv("TG_BOT_API", "https://api.telegram.org")
@@ -72,15 +85,18 @@ scdl_bin = local[os.path.join(BIN_PATH, "scdl")]
 bcdl_bin = local[os.path.join(BIN_PATH, "bandcamp-dl")]
 BCDL_ENABLE = False
 WORKERS = int(os.getenv("WORKERS", 2))
-# TODO try to change to spawn or forkserver to save RAM
-mp_method = "fork"
+# FIXME consider change from 'fork' to 'spawn' or 'forkserver'
+mp_method = "forkserver"
 if platform.system() == "Windows":
     mp_method = "spawn"
 # https://stackoverflow.com/a/66113051
 # https://superfastpython.com/processpoolexecutor-multiprocessing-context/
 # https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
 # https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor
-EXECUTOR = concurrent.futures.ProcessPoolExecutor(max_workers=WORKERS, mp_context=get_context(method=mp_method))
+# EXECUTOR = concurrent.futures.ProcessPoolExecutor(max_workers=WORKERS, mp_context=get_context(method=mp_method))
+# FIXME max_tasks
+EXECUTOR = ProcessPool(initializer=pp_initializer, initargs=(MAX_MEM,), max_workers=WORKERS, max_tasks=20, context=get_context(method=mp_method))
+# EXECUTOR = ProcessPool(max_workers=WORKERS, max_tasks=20, context=get_context(method=mp_method))
 DL_TIMEOUT = int(os.getenv("DL_TIMEOUT", 300))
 CHECK_URL_TIMEOUT = int(os.getenv("CHECK_URL_TIMEOUT", 30))
 # Timeouts: https://www.python-httpx.org/advanced/
@@ -189,7 +205,7 @@ logger = logging.getLogger(__name__)
 # Systemd watchdog monitoring:
 SYSTEMD_NOTIFIER = sdnotify.SystemdNotifier()
 
-# TODO randomize User-Agent
+# FIXME randomize User-Agent
 # UA = UserAgent()
 # UA.update()
 
@@ -264,7 +280,7 @@ def get_link_text(urls):
     link_text = ""
     for i, url in enumerate(urls):
         link_text += "[Source Link #{}]({}) | `{}`\n".format(str(i + 1), url, URL(url).host)
-        # TODO long link message split in many
+        # TODO split long link message to multiple ones
         direct_urls = urls[url].splitlines()[:3]
         for idx, direct_url in enumerate(direct_urls):
             if direct_url.startswith("http"):
@@ -424,7 +440,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     urls_dict = {}
 
     # Get our main running asyncio loop:
-    loop_main = asyncio.get_event_loop()
+    loop_main = asyncio.get_running_loop()
 
     # a) Run heavy task blocking the main running asyncio loop.
     # Needs to have timeout signals in function, but they are bad.
@@ -435,16 +451,16 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     # You may add timeout signals in function, but they are bad.
     # If ThreadPoolExecutor - no signals.
     # We monitor EXECUTOR process pool task queue, so we use it.
-    # FIXME maybe don't use wait_for here because it includes pool queue waiting
 
     # pool = concurrent.futures.ThreadPoolExecutor()
     try:
         # https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor
         # https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for
-        urls_dict = await asyncio.wait_for(
-            loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, message, action, proxy, source_ip, allow_unknown_sites),
-            timeout=CHECK_URL_TIMEOUT * 10,
-        )
+        # urls_dict = await asyncio.wait_for(
+        #     loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, message, action, proxy, source_ip, allow_unknown_sites),
+        #     timeout=CHECK_URL_TIMEOUT * 10,
+        # )
+        urls_dict = await loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, CHECK_URL_TIMEOUT, message, action, proxy, source_ip, allow_unknown_sites)
     except asyncio.TimeoutError:
         logger.debug("get_direct_urls_dict took too much time and was dropped (but still running)")
     except Exception:
@@ -494,7 +510,8 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                     }
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
-                    EXECUTOR.submit(download_url_and_send, **kwargs)
+                    # EXECUTOR.submit(download_url_and_send, **kwargs)
+                    EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
 
     elif action == "link":
         if "http" not in urls_values:
@@ -558,7 +575,6 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     context.chat_data["settings"]["mode"] = button_action
             elif button_action in ["flood", "allow_unknown_sites"]:
                 # Toggles:
-                # TODO support multiple settings windows
                 current_setting = context.chat_data["settings"][button_action]
                 context.chat_data["settings"][button_action] = not current_setting
                 setting_changed = True
@@ -598,7 +614,8 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 }
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                 # Run heavy task in separate process, "fire and forget":
-                EXECUTOR.submit(download_url_and_send, **kwargs)
+                # EXECUTOR.submit(download_url_and_send, **kwargs)
+                EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
 
         elif button_action == "link":
             await context.bot.send_message(chat_id=chat_id, reply_to_message_id=url_message_id, parse_mode="Markdown", disable_web_page_preview=True, text=get_link_text(urls_dict))
@@ -621,26 +638,37 @@ async def unknown_command_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 async def error_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):  # skipcq: PYL-R0201
-    try:
-        raise context.error
-    except Forbidden:
-        # remove update.message.chat_id from conversation list
-        logger.debug(f"Update {update} caused Forbidden error: {context.error}")
-    except BadRequest:
-        # handle malformed requests - read more below!
-        logger.debug(f"Update {update} caused BadRequest error: {context.error}")
-    except TimedOut:
-        # handle slow connection problems
-        logger.debug(f"Update {update} caused TimedOut error: {context.error}")
-    except NetworkError:
-        # handle other connection problems
-        logger.debug(f"Update {update} caused NetworkError error: {context.error}")
-    except ChatMigrated as e:
-        # the chat_id of a group has changed, use e.new_chat_id instead
-        logger.debug(f"Update {update} caused ChatMigrated error: {context.error}")
-    except TelegramError:
-        # handle all other telegram related errors
-        logger.debug(f"Update {update} caused TelegramError error: {context.error}")
+    # https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/errorhandlerbot.py#L29
+    # TODO send telegram message to bot owner as well
+    # Log the error before we do anything else, so we can see it even if something breaks.
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # traceback.format_exception returns the usual python message about an exception, but as a
+    # list of strings rather than a single string, so we have to join them together.
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    logger.debug(tb_string)
+
+    # try:
+    #     raise context.error
+    # except Forbidden:
+    #     # remove update.message.chat_id from conversation list
+    #     logger.debug(f"Update {update} caused Forbidden error: {context.error}")
+    # except BadRequest:
+    #     # handle malformed requests - read more below!
+    #     logger.debug(f"Update {update} caused BadRequest error: {context.error}")
+    # except TimedOut:
+    #     # handle slow connection problems
+    #     logger.debug(f"Update {update} caused TimedOut error: {context.error}")
+    # except NetworkError:
+    #     # handle other connection problems
+    #     logger.debug(f"Update {update} caused NetworkError error: {context.error}")
+    # except ChatMigrated as e:
+    #     # the chat_id of a group has changed, use e.new_chat_id instead
+    #     logger.debug(f"Update {update} caused ChatMigrated error: {context.error}")
+    # except TelegramError:
+    #     # handle all other telegram related errors
+    #     logger.debug(f"Update {update} caused TelegramError error: {context.error}")
 
 
 def init_chat_data(chat_data, mode="dl", flood=True):
@@ -664,7 +692,7 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
         url_str = url_entities[entity]
         if "://" not in url_str:
             url_str = "http://" + url_str
-        # TODO try except
+        # FIXME try except
         url = URL(url_str)
         if url_valid_and_allowed(url, allow_unknown_sites=allow_unknown_sites):
             logger.info("Entity URL parsed: %s", url)
@@ -688,11 +716,13 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
 
     urls_dict = {}
     for url_item in urls:
-        # FIXME better check domain in hostname
+        # FIXME better check domain in hostname and support YouTube Music
         unknown_site = not any((site in url_item.host for site in DOMAINS))
         # unshorten soundcloud.app.goo.gl and unknown sites links
         # example: https://soundcloud.app.goo.gl/mBMvG
-        if unknown_site or DOMAIN_SC in url_item.host:
+        # FIXME ?
+        # if unknown_site or DOMAIN_SC in url_item.host:
+        if DOMAIN_SC in url_item.host:
             proxy_arg = None
             if proxy:
                 proxy_arg = {"http": proxy, "https": proxy}
@@ -701,7 +731,7 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
                     requests.head(
                         url_item.to_text(full_quote=True),
                         allow_redirects=True,
-                        timeout=2,
+                        timeout=3,
                         proxies=proxy_arg,
                         # headers={"User-Agent": UA.random},
                         headers={"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:105.0) Gecko/20100101 Firefox/105.0"},
@@ -719,8 +749,10 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
         if mode == "link" or unknown_site:
             # We run it if it was explicitly requested as per "link" mode.
             # We run it for links from unknown sites (if they were allowed).
+            # FIXME For now we avoid extra requests on asking just to improve performance. We are okay with useless asking (for unknown sites). Link mode will be removed.
             # If it's known site, we need to check it more thoroughly below.
-            urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            # urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            urls_dict[url_text] = "http"
         elif DOMAIN_SC in url.host and (2 <= url_parts_num <= 4 or DOMAIN_SC_API in url.host) and (not "you" in url.path_parts):
             # SoundCloud: tracks, sets and widget pages, no /you/ pages
             # TODO support private sets URLs that have 5 parts
@@ -732,8 +764,10 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
             urls_dict[url_text] = "http"
         elif (DOMAIN_YT in url.host or DOMAIN_YT_BE in url.host) and (DOMAIN_YT_BE in url.host or "watch" in url.path or "playlist" in url.path):
             # YouTube: videos and playlists
-            # We still run it for checking YouTube region restriction to avoid fake asking:
-            urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            # We still run it for checking YouTube region restriction to avoid useless asking.
+            # FIXME For now we avoid extra requests on asking just to improve performance. We are okay with useless asking.
+            # urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            urls_dict[url_text] = "http"
         elif DOMAIN_YMR in url.host or DOMAIN_YMC in url.host:
             # YM: tracks. Note that the domain includes x.com..
             # We know for sure these links can be downloaded, so we just skip running ydl_get_direct_urls
@@ -742,10 +776,12 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
             # TikTok: videos
             # We know for sure these links can be downloaded, so we just skip running ydl_get_direct_urls
             urls_dict[url_text] = "http"
-        elif DOMAIN_IG in url.host:
+        elif DOMAIN_IG in url.host and (2 <= url_parts_num):
             # Instagram: videos, reels
-            # TODO We run it for checking Instagram ban to avoid fake asking:
-            urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            # We run it for checking Instagram ban to avoid useless asking.
+            # FIXME For now we avoid extra requests on asking just to improve performance. We are okay with useless asking.
+            # urls_dict[url_text] = ydl_get_direct_urls(url_text, COOKIES_FILE, source_ip, proxy)
+            urls_dict[url_text] = "http"
         elif (DOMAIN_TW in url.host or DOMAIN_TWX in url.host) and (DOMAIN_YMC not in url.host) and (3 <= url_parts_num <= 3):
             # Twitter: videos
             # We know for sure these links can be downloaded, so we just skip running ydl_get_direct_urls
@@ -783,7 +819,7 @@ def ydl_get_direct_urls(url, cookies_file=None, source_ip=None, proxy=None):
                 logger.debug("download_url_and_send could not download cookies file")
                 pass
         elif cookies_file.startswith("firefox:"):
-            # TODO better handling of env var
+            # TODO handle env var better
             cookies_file_components = cookies_file.split(":", maxsplit=2)
             if len(cookies_file_components) == 3:
                 cookies_sqlite_file = cookies_file_components[2]
@@ -806,10 +842,11 @@ def ydl_get_direct_urls(url, cookies_file=None, source_ip=None, proxy=None):
             cookies_download_file.close()
             ydl_opts["cookiefile"] = str(cookies_download_file_path)
 
-    # FIXME apply CHECK_URL_TIMEOUT by using a process (as we did before). Maybe use https://github.com/noxdafox/pebble
     logger.debug("%s starts: %s", cmd_name, url)
     try:
-        info_dict = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
+        # https://github.com/yt-dlp/yt-dlp/blob/master/README.md#embedding-examples
+        unsanitized_info_dict = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
+        info_dict = ydl.YoutubeDL(ydl_opts).sanitize_info(unsanitized_info_dict)
         # TODO actualize checks, fix for youtube playlists
         if "url" in info_dict:
             direct_url = info_dict["url"]
@@ -862,7 +899,7 @@ def download_url_and_send(
     # We can't use asyncio.run_coroutine_threadsafe(coro, loop_main) because it doesn't work (interferes with framework?).
     # So we run additional loop in additional thread and just use it:
     loop_additional = asyncio.new_event_loop()
-    thread_additional = threading.Thread(target=loop_additional.run_forever, name="Async Runner", daemon=True)
+    thread_additional = threading.Thread(target=loop_additional.run_forever, name="Additional Async Runner", daemon=True)
 
     def run_async(coro):
         if not thread_additional.is_alive():
@@ -939,7 +976,9 @@ def download_url_and_send(
         try:
             cmd_stdout, cmd_stderr = cmd_proc.communicate(input=cmd_input, timeout=DL_TIMEOUT)
             cmd_retcode = cmd_proc.returncode
-            # listed are common scdl problems for one track with 0 retcode, all its output is always in stderr:
+            # listed are common scdl problems for one track with 0 retcode, all its log output goes to stderr (track may be in stdout):
+            # https://github.com/scdl-org/scdl/issues/493
+            # https://github.com/scdl-org/scdl/pull/494
             if cmd_retcode or (any(err in cmd_stderr for err in ["Error resolving url", "is not streamable", "Failed to get item"]) and ".mp3" not in cmd_stderr):
                 raise ProcessExecutionError(cmd_args, cmd_retcode, cmd_stdout, cmd_stderr)
             logger.debug("%s succeeded: %s", cmd_name, url)
@@ -963,7 +1002,7 @@ def download_url_and_send(
             "outtmpl": os.path.join(download_dir, "%(title).16s [%(id)s].%(ext)s"),
             "restrictfilenames": True,
             "windowsfilenames": True,
-            # TODO Support ffmpeg_location parameter or just use BIN_PATH here:
+            # FIXME support ffmpeg_location parameter or just use BIN_PATH here:
             # "ffmpeg_location": "/home/gpchelkin/.local/bin/",
             # "trim_file_name": 32,
         }
@@ -979,7 +1018,7 @@ def download_url_and_send(
                 {
                     "format": "mp4",
                     "postprocessors": [
-                        # Instagram gives VP9 cideo codec (when downloading with cookies) and it doesn't play in Telegram iOS client.
+                        # Instagram gives VP9 video codec (when downloading with cookies) and it doesn't play in Telegram iOS client.
                         # We need AVC (x264/h264) or HEVC (x265/h265) video (+ AAC audio) from Instagram videos.
                         # "FFmpegVideoConvertor" doesn't work here since the original file is already mp4.
                         # We don't touch audio and just copy it here since it's probably OK in original. But we can change 'copy' to 'aac'.
@@ -992,7 +1031,7 @@ def download_url_and_send(
                         {"key": "FFmpegCopyStream"},
                     ],
                     "postprocessor_args": {
-                        "copystream": ["-codec:v", "libx264", "-crf", "24", "-preset", "veryfast", "-codec:a", "copy", "-f", "mp4"],
+                        "copystream": ["-codec:v", "libx264", "-crf", "24", "-preset", "veryfast", "-codec:a", "copy", "-f", "mp4", "-threads", "1"],
                     },
                 }
             )
@@ -1005,6 +1044,10 @@ def download_url_and_send(
                         {"key": "FFmpegMetadata"},
                         # {"key": "EmbedThumbnail"},
                     ],
+                    "postprocessor_args": {
+                        "ExtractAudio": ["-threads", "1"],
+                        "extractaudio": ["-threads", "1"],
+                    },
                     "noplaylist": True,
                 }
             )
@@ -1027,7 +1070,6 @@ def download_url_and_send(
                     logger.debug("download_url_and_send could not download cookies file")
                     pass
             elif cookies_file.startswith("firefox:"):
-                # TODO better handling of env var
                 cookies_file_components = cookies_file.split(":", maxsplit=2)
                 if len(cookies_file_components) == 3:
                     cookies_sqlite_file = cookies_file_components[2]
@@ -1050,18 +1092,26 @@ def download_url_and_send(
                 cookies_download_file.close()
                 ydl_opts["cookiefile"] = str(cookies_download_file_path)
 
-        # FIXME apply DL_TIMEOUT by using a process (as we did before). Maybe use https://github.com/noxdafox/pebble
         logger.debug("%s starts: %s", cmd_name, url)
         try:
             # TODO check result
+            # https://github.com/yt-dlp/yt-dlp/blob/master/README.md#embedding-examples
             info_dict = ydl.YoutubeDL(ydl_opts).download([url])
             logger.debug("%s succeeded: %s", cmd_name, url)
             status = "success"
             if download_video:
-                info_dict = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
+                unsanitized_info_dict = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
+                info_dict = ydl.YoutubeDL(ydl_opts).sanitize_info(unsanitized_info_dict)
                 if "description" in info_dict and info_dict["description"]:
-                    # TODO better handle right-to-left hashtags https://www.instagram.com/reel/CtZbNhtrJv3/
-                    add_description = escape_markdown(info_dict["description"][:800], version=1)
+                    # TODO handle right-to-left hashtags better (like https://www.instagram.com/reel/CtZbNhtrJv3/)
+                    # TODO format as bold/link/quote
+                    unescaped_add_description = "\n"
+                    if "channel" in info_dict and info_dict["channel"]:
+                        unescaped_add_description += "@ " + info_dict["channel"]
+                    if "uploader" in info_dict and info_dict["uploader"]:
+                        unescaped_add_description += " " + info_dict["uploader"]
+                    unescaped_add_description += "\n" + info_dict["description"][:800]
+                    add_description = escape_markdown(unescaped_add_description, version=1)
         except Exception as exc:
             print(exc)
             logger.debug("%s failed: %s", cmd_name, url)
@@ -1108,7 +1158,7 @@ def download_url_and_send(
                             ffinput = ffmpeg.input(file)
                             # https://kkroening.github.io/ffmpeg-python/#ffmpeg.output
                             # We could set audio_bitrate="320k", but we don't need it now
-                            ffmpeg.output(ffinput, file_converted, vn=None).run()
+                            ffmpeg.output(ffinput, file_converted, vn=None, threads=1).run()
                             file = file_converted
                             file_root, file_ext = os.path.splitext(file)
                             file_format = file_ext.replace(".", "").lower()
@@ -1139,9 +1189,9 @@ def download_url_and_send(
                                 file_part = file.replace(file_ext, ".part{}{}".format(str(i + 1), file_ext))
                                 ffinput = ffmpeg.input(file)
                                 if i == (parts_number - 1):
-                                    ffmpeg.output(ffinput, file_part, codec="copy", vn=None, ss=cur_position).run()
+                                    ffmpeg.output(ffinput, file_part, codec="copy", vn=None, ss=cur_position, threads=1).run()
                                 else:
-                                    ffmpeg.output(ffinput, file_part, codec="copy", vn=None, ss=cur_position, fs=part_size).run()
+                                    ffmpeg.output(ffinput, file_part, codec="copy", vn=None, ss=cur_position, fs=part_size, threads=1).run()
                                     part_duration = float(ffmpeg.probe(file_part)["format"]["duration"])
                                     cur_position += part_duration
                                 if id3:
@@ -1184,7 +1234,7 @@ def download_url_and_send(
                         bot.send_message(
                             chat_id=chat_id,
                             reply_to_message_id=reply_to_message_id,
-                            text="*Sorry*, not enough memory to convert file `{}`..".format(file_name),
+                            text="*Sorry*, I do not have enough resources to convert the file `{}`..".format(file_name),
                             parse_mode="Markdown",
                         )
                     )
@@ -1194,7 +1244,7 @@ def download_url_and_send(
                         bot.send_message(
                             chat_id=chat_id,
                             reply_to_message_id=reply_to_message_id,
-                            text="*Sorry*, not enough memory to convert file `{}`..".format(file_name),
+                            text="*Sorry*, I do not have enough resources to convert the file `{}`..".format(file_name),
                             parse_mode="Markdown",
                         )
                     )
@@ -1213,10 +1263,10 @@ def download_url_and_send(
                         source = "Bandcamp"
                     else:
                         source = url_obj.host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "")
-                    # TODO fix youtube id in []
+                    # TODO fix youtube id in [] ?
                     caption = "@{} _got it from_ [{}]({}){}".format(bot.username.replace("_", r"\_"), source, url, addition.replace("_", r"\_"))
                     if add_description:
-                        caption += "\n\n" + add_description
+                        caption += add_description
                     # logger.debug(caption)
                     reply_to_message_id_send = reply_to_message_id
                 sent_audio_ids = []
@@ -1339,7 +1389,9 @@ def download_url_and_send(
 
 
 async def post_shutdown(application: Application) -> None:
-    EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    # EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    EXECUTOR.stop()
+    EXECUTOR.join(timeout=10)
 
 
 async def post_init(application: Application) -> None:
@@ -1392,12 +1444,13 @@ def main():
         .persistence(persistence)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .concurrent_updates(256)
-        .connection_pool_size(512)
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .concurrent_updates(WORKERS * 2)
+        .connection_pool_size(WORKERS * 4)
+        .pool_timeout(COMMON_CONNECTION_TIMEOUT)
         .connect_timeout(COMMON_CONNECTION_TIMEOUT)
         .read_timeout(COMMON_CONNECTION_TIMEOUT)
         .write_timeout(COMMON_CONNECTION_TIMEOUT)
-        .pool_timeout(COMMON_CONNECTION_TIMEOUT)
         .build()
     )
 
@@ -1434,7 +1487,7 @@ def main():
 
     job_queue = application.job_queue
     job_watchdog = job_queue.run_repeating(callback_watchdog, interval=60, first=10)
-    job_monitor = job_queue.run_repeating(callback_monitor, interval=5, first=5)
+    # job_monitor = job_queue.run_repeating(callback_monitor, interval=5, first=5)
 
     if WEBHOOK_ENABLE:
         application.run_webhook(
@@ -1444,12 +1497,17 @@ def main():
             url_path=WEBHOOK_APP_URL_PATH,
             webhook_url=urljoin(WEBHOOK_APP_URL_ROOT, WEBHOOK_APP_URL_PATH),
             secret_token=WEBHOOK_SECRET_TOKEN,
-            max_connections=1024,
+            max_connections=WORKERS * 4,
             cert=WEBHOOK_CERT_FILE,
             key=WEBHOOK_KEY_FILE,
         )
     else:
-        # TODO await it somehow
+        # TODO await it somehow or change to something like this:
+        # https://docs.python-telegram-bot.org/en/stable/telegram.bot.html
+        # https://docs.python-telegram-bot.org/en/stable/telegram.ext.application.html#telegram.ext.Application.run_polling
+        # https://github.com/python-telegram-bot/python-telegram-bot/discussions/3310
+        # https://github.com/python-telegram-bot/python-telegram-bot/wiki/Frequently-requested-design-patterns#running-ptb-alongside-other-asyncio-frameworks
+        # https://docs.python-telegram-bot.org/en/v21.5/examples.customwebhookbot.html
         application.bot.delete_webhook()
         application.run_polling(
             drop_pending_updates=True,
